@@ -52,6 +52,7 @@ Date:
         - Check IDE0052 in the CI format step, so unread private members fail the build check.
         - Ignore .vscode/launch.json, as launch configurations contain personal paths and settings.
         - Document the distinction between project settings and preferences.
+        - Split ProductionTable.Solve into building a SolverModel (a snapshot of the linear program), solving it, and applying the solution to the model. The solutions are unchanged.
 ----------------------------------------------------------------------------------------------------------------------
 Version: 2.21.0
 Date: 25 October 2026

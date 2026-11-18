@@ -6,7 +6,6 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Google.OrTools.LinearSolver;
-using Serilog;
 using Yafc.Core;
 using Yafc.I18n;
 
@@ -20,7 +19,6 @@ public struct ProductionTableFlow(IObjectWithQuality<Goods> goods, float amount,
 
 [DeserializeWithNonPublicConstructor]
 public sealed partial class ProductionTable : ProjectPageContents, IComparer<ProductionTableFlow>, IElementGroup<RecipeRow> {
-    private static readonly ILogger logger = Logging.GetLogger<ProductionTable>();
     private readonly ProductionTable rootTable;
     [SkipSerialization] public Dictionary<IObjectWithQuality<Goods>, IProductionLink> linkMap { get; } = [];
     List<RecipeRow> IElementGroup<RecipeRow>.elements => recipes;
@@ -446,52 +444,52 @@ match:
     }
 
     /// <summary>
-    /// Add/update the variable value for the constraint with the given amount, and store the recipe to the production link.
+    /// Store the recipe to the production link, and add the coefficient for the link and recipe to the <paramref name="model"/>.
     /// </summary>
+    /// <param name="model">The model that will receive the coefficient.</param>
+    /// <param name="link">The link to update. Its <see cref="IProductionLink.solverIndex"/> is the row for the coefficient.</param>
+    /// <param name="column">The index of the recipe in the <paramref name="model"/>.</param>
+    /// <param name="recipe">The recipe that produces or consumes the goods of the link.</param>
+    /// <param name="amount">The production (positive) or consumption (negative) of one run of the recipe. If the same link and recipe are added
+    /// more than once, the amounts are added together.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void AddLinkCoefficient(Constraint cst, Variable var, IProductionLink link, ISolverRow recipe, float amount) {
-        // GetCoefficient will return 0 when the variable is not available in the constraint
-        amount += (float)cst.GetCoefficient(var);
+    private static void AddLinkCoefficient(SolverModel model, IProductionLink link, int column, ISolverRow recipe, float amount) {
         _ = link.capturedRecipes.Add(recipe);
-        cst.SetCoefficient(var, amount);
+        model.coefficients.Add(new SolverModel.Coefficient(link.solverIndex, column, amount));
     }
 
-    public override async Task<string?> Solve(ProjectPage page) {
-        using var productionTableSolver = DataUtils.CreateSolver();
-        var objective = productionTableSolver.Objective();
-        objective.SetMinimization();
+    /// <summary>
+    /// Prepares this table, and the tables nested in it, for solving, and creates a <see cref="SolverModel"/> that describes the problem for the
+    /// solver. This updates the model (recipe rows and links) with the information that does not depend on the solution, and it must be called
+    /// on the model thread.
+    /// </summary>
+    private SolverModel BuildSolverModel() {
         List<ISolverRow> allRecipes = [];
         List<IProductionLink> allLinks = [];
         Setup(allRecipes, allLinks, []);
-        Variable[] vars = new Variable[allRecipes.Count];
-        float[] objCoefficients = new float[allRecipes.Count];
+        SolverModel model = new(allRecipes, allLinks);
 
         for (int i = 0; i < allRecipes.Count; i++) {
             var recipe = allRecipes[i];
-            var variable = productionTableSolver.MakeNumVar(0f, double.PositiveInfinity, recipe.SolverName);
+            model.columnNames[i] = recipe.SolverName;
+            model.columnCosts[i] = recipe.BaseCost;
 
             if (recipe.fixedBuildings > 0f) {
-                double fixedRps = (double)recipe.fixedBuildings / recipe.parameters.recipeTime;
-                variable.SetBounds(fixedRps, fixedRps);
+                model.fixedRecipesPerSecond[i] = (double)recipe.fixedBuildings / recipe.parameters.recipeTime;
             }
-            vars[i] = variable;
         }
-
-        Constraint[] constraints = new Constraint[allLinks.Count];
 
         for (int i = 0; i < allLinks.Count; i++) {
             var link = allLinks[i];
-            float min = link.algorithm == LinkAlgorithm.AllowOverConsumption ? float.NegativeInfinity : link.amount;
-            float max = link.algorithm == LinkAlgorithm.AllowOverProduction ? float.PositiveInfinity : link.amount;
-            var constraint = productionTableSolver.MakeConstraint(min, max, link.goods.QualityName() + "_recipe");
-            constraints[i] = constraint;
+            model.rowMin[i] = link.algorithm == LinkAlgorithm.AllowOverConsumption ? double.NegativeInfinity : link.amount;
+            model.rowMax[i] = link.algorithm == LinkAlgorithm.AllowOverProduction ? double.PositiveInfinity : link.amount;
+            model.rowNames[i] = link.goods.QualityName() + "_recipe";
             link.solverIndex = i;
             link.flags = link.amount > 0 ? ProductionLink.Flags.HasConsumption : link.amount < 0 ? ProductionLink.Flags.HasProduction : 0;
         }
 
         for (int i = 0; i < allRecipes.Count; i++) {
             var recipe = allRecipes[i];
-            var recipeVar = vars[i];
             var links = recipe.links;
 
             foreach (var product in recipe.ProductsForSolver) {
@@ -501,13 +499,7 @@ match:
 
                 if (recipe.FindLink(product.Goods, out var link)) {
                     link.flags |= ProductionLink.Flags.HasProduction;
-                    float added = product.Amount;
-                    AddLinkCoefficient(constraints[link.solverIndex], recipeVar, link, recipe, added);
-                    float cost = product.Goods.target.Cost();
-
-                    if (cost > 0f) {
-                        objCoefficients[i] += added * cost;
-                    }
+                    AddLinkCoefficient(model, link, i, recipe, product.Amount);
                 }
 
                 links.products[product.LinkIndex, product.Goods.quality] = link;
@@ -516,7 +508,7 @@ match:
             foreach (var ingredient in recipe.IngredientsForSolver) {
                 if (recipe.FindLink(ingredient.Goods, out var link)) {
                     link.flags |= ProductionLink.Flags.HasConsumption;
-                    AddLinkCoefficient(constraints[link.solverIndex], recipeVar, link, recipe, -ingredient.Amount);
+                    AddLinkCoefficient(model, link, i, recipe, -ingredient.Amount);
                 }
 
                 links.ingredients[ingredient.LinkIndex] = link as ProductionLink;
@@ -530,7 +522,7 @@ match:
                 if (recipe.FindLink(recipe.fuel, out var link)) {
                     links.fuel = link as ProductionLink;
                     link.flags |= ProductionLink.Flags.HasConsumption;
-                    AddLinkCoefficient(constraints[link.solverIndex], recipeVar, link, recipe, -fuelAmount);
+                    AddLinkCoefficient(model, link, i, recipe, -fuelAmount);
                 }
             }
         }
@@ -545,133 +537,55 @@ match:
                 }
 
                 link.flags |= ProductionLink.Flags.LinkNotMatched;
-                constraints[link.solverIndex].SetBounds(double.NegativeInfinity, double.PositiveInfinity); // remove link constraints
+                // remove link constraints
+                model.rowMin[link.solverIndex] = double.NegativeInfinity;
+                model.rowMax[link.solverIndex] = double.PositiveInfinity;
             }
         }
+
+        return model;
+    }
+
+    public override async Task<string?> Solve(ProjectPage page) {
+        SolverModel model = BuildSolverModel();
 
         await page.owner.modelThreadSwitcher.SwitchToBackground();
 
-        for (int i = 0; i < allRecipes.Count; i++) {
-            objective.SetCoefficient(vars[i], allRecipes[i].BaseCost);
-        }
+        SolverModel.Solution solution = model.Solve();
 
-        var result = productionTableSolver.Solve();
-
-        if (result is not Solver.ResultStatus.FEASIBLE and not Solver.ResultStatus.OPTIMAL) {
-            objective.Clear();
-            var (deadlocks, splits) = GetInfeasibilityCandidates(allRecipes);
-            (Variable? positive, Variable? negative)[] slackVars = new (Variable? positive, Variable? negative)[allLinks.Count];
-
-            // Solution does not exist. Adding slack variables to find the reason
-            foreach (var link in deadlocks) {
-                // Adding negative slack to possible deadlocks (loops)
-                var constraint = constraints[link.solverIndex];
-                float cost = MathF.Abs(link.goods.target.Cost());
-                var negativeSlack = productionTableSolver.MakeNumVar(0d, double.PositiveInfinity, "negative-slack." + link.goods.QualityName());
-                constraint.SetCoefficient(negativeSlack, cost);
-                objective.SetCoefficient(negativeSlack, 1f);
-                slackVars[link.solverIndex].negative = negativeSlack;
-            }
-
-            foreach (var link in splits) {
-                // Adding positive slack to splits
-                float cost = MathF.Abs(link.goods.target.Cost());
-                var constraint = constraints[link.solverIndex];
-                var positiveSlack = productionTableSolver.MakeNumVar(0d, double.PositiveInfinity, "positive-slack." + link.goods.QualityName());
-                constraint.SetCoefficient(positiveSlack, -cost);
-                objective.SetCoefficient(positiveSlack, 1f);
-                slackVars[link.solverIndex].positive = positiveSlack;
-            }
-
-            result = productionTableSolver.Solve();
-
-            logger.Information("Solver finished with result {result}", result);
+        if (solution.diagnosticsRan) {
             await page.owner.modelThreadSwitcher.SwitchToForeground();
-
-            if (result is Solver.ResultStatus.OPTIMAL or Solver.ResultStatus.FEASIBLE) {
-                List<IProductionLink> linkList = [];
-
-                for (int i = 0; i < allLinks.Count; i++) {
-                    var (posSlack, negSlack) = slackVars[i];
-
-                    if (posSlack is not null && posSlack.BasisStatus() != Solver.BasisStatus.AT_LOWER_BOUND) {
-                        linkList.Add(allLinks[i]);
-                        allLinks[i].notMatchedFlow += (float)posSlack.SolutionValue();
-                    }
-
-                    if (negSlack is not null && negSlack.BasisStatus() != Solver.BasisStatus.AT_LOWER_BOUND) {
-                        linkList.Add(allLinks[i]);
-                        allLinks[i].notMatchedFlow -= (float)negSlack.SolutionValue();
-                    }
-                }
-
-                foreach (var link in linkList) {
-                    if (link.notMatchedFlow == 0f) {
-                        continue;
-                    }
-
-                    link.flags |= ProductionLink.Flags.LinkNotMatched | ProductionLink.Flags.LinkRecursiveNotMatched;
-                    RecipeRow? ownerRecipe = link.owner.owner as RecipeRow;
-
-                    while (ownerRecipe != null) {
-                        if (link.notMatchedFlow > 0f) {
-                            ownerRecipe.parameters.warningFlags |= WarningFlags.OverproductionRequired;
-                        }
-                        else {
-                            ownerRecipe.parameters.warningFlags |= WarningFlags.DeadlockCandidate;
-                        }
-
-                        ownerRecipe = ownerRecipe.owner.owner as RecipeRow;
-                    }
-                }
-
-                foreach (var recipe in allRecipes) {
-                    FindAllRecipeLinks(recipe, linkList, linkList);
-
-                    foreach (var link in linkList) {
-                        if (link.flags.HasFlags(ProductionLink.Flags.LinkRecursiveNotMatched)) {
-                            if (link.notMatchedFlow > 0f) {
-                                recipe.parameters.warningFlags |= WarningFlags.OverproductionRequired;
-                            }
-                            else {
-                                recipe.parameters.warningFlags |= WarningFlags.DeadlockCandidate;
-                            }
-                        }
-                    }
-                }
-            }
-            else {
-                if (result == Solver.ResultStatus.INFEASIBLE) {
-                    return LSs.ProductionTableNoSolutionAndNoDeadlocks;
-                }
-
-                if (result == Solver.ResultStatus.ABNORMAL) {
-                    return LSs.ProductionTableNumericalErrors;
-                }
-
-                return LSs.ProductionTableUnexpectedError.L(result);
-            }
         }
 
-        for (int i = 0; i < allLinks.Count; i++) {
-            var link = allLinks[i];
-            var constraint = constraints[i];
-
-            if (constraint == null) {
-                continue;
+        if (!solution.hasSolution) {
+            if (solution.status == Solver.ResultStatus.INFEASIBLE) {
+                return LSs.ProductionTableNoSolutionAndNoDeadlocks;
             }
 
-            var basisStatus = constraint.BasisStatus();
+            if (solution.status == Solver.ResultStatus.ABNORMAL) {
+                return LSs.ProductionTableNumericalErrors;
+            }
+
+            return LSs.ProductionTableUnexpectedError.L(solution.status);
+        }
+
+        // If the solver did not need the diagnostics, the rest of this method (like the previous steps) still runs on the background thread.
+        // The caller switches back to the foreground thread.
+        if (solution.diagnosticsRan) {
+            ApplyInfeasibilityDiagnostics(model, solution);
+        }
+
+        for (int i = 0; i < model.links.Count; i++) {
+            var link = model.links[i];
+            var basisStatus = solution.rowBasisStatus[i];
 
             if ((basisStatus == Solver.BasisStatus.BASIC || basisStatus == Solver.BasisStatus.FREE) && (link.notMatchedFlow != 0 || link.algorithm != LinkAlgorithm.Match)) {
                 link.flags |= ProductionLink.Flags.LinkNotMatched;
             }
-
         }
 
-        for (int i = 0; i < allRecipes.Count; i++) {
-            var recipe = allRecipes[i];
-            recipe.recipesPerSecond = vars[i].SolutionValue();
+        for (int i = 0; i < model.recipes.Count; i++) {
+            model.recipes[i].recipesPerSecond = solution.recipesPerSecond[i];
         }
 
         bool builtCountExceeded = CheckBuiltCountExceeded();
@@ -679,6 +593,63 @@ match:
         CalculateFlow(null);
 
         return builtCountExceeded ? LSs.ProductionTableRequiresMoreBuildings : null;
+    }
+
+    /// <summary>
+    /// Updates the links and recipe rows with the likely reason the <paramref name="model"/> had no solution without the slack variables.
+    /// </summary>
+    /// <param name="model">The model that was solved.</param>
+    /// <param name="solution">The solution that includes the slack variables.</param>
+    private static void ApplyInfeasibilityDiagnostics(SolverModel model, SolverModel.Solution solution) {
+        List<IProductionLink> allLinks = model.links;
+        List<IProductionLink> linkList = [];
+
+        for (int i = 0; i < allLinks.Count; i++) {
+            if (solution.positiveSlack[i] is double posSlack) {
+                linkList.Add(allLinks[i]);
+                allLinks[i].notMatchedFlow += (float)posSlack;
+            }
+
+            if (solution.negativeSlack[i] is double negSlack) {
+                linkList.Add(allLinks[i]);
+                allLinks[i].notMatchedFlow -= (float)negSlack;
+            }
+        }
+
+        foreach (var link in linkList) {
+            if (link.notMatchedFlow == 0f) {
+                continue;
+            }
+
+            link.flags |= ProductionLink.Flags.LinkNotMatched | ProductionLink.Flags.LinkRecursiveNotMatched;
+            RecipeRow? ownerRecipe = link.owner.owner as RecipeRow;
+
+            while (ownerRecipe != null) {
+                if (link.notMatchedFlow > 0f) {
+                    ownerRecipe.parameters.warningFlags |= WarningFlags.OverproductionRequired;
+                }
+                else {
+                    ownerRecipe.parameters.warningFlags |= WarningFlags.DeadlockCandidate;
+                }
+
+                ownerRecipe = ownerRecipe.owner.owner as RecipeRow;
+            }
+        }
+
+        foreach (var recipe in model.recipes) {
+            FindAllRecipeLinks(recipe, linkList, linkList);
+
+            foreach (var link in linkList) {
+                if (link.flags.HasFlags(ProductionLink.Flags.LinkRecursiveNotMatched)) {
+                    if (link.notMatchedFlow > 0f) {
+                        recipe.parameters.warningFlags |= WarningFlags.OverproductionRequired;
+                    }
+                    else {
+                        recipe.parameters.warningFlags |= WarningFlags.DeadlockCandidate;
+                    }
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -734,7 +705,7 @@ match:
         }
     }
 
-    private static (List<IProductionLink> merges, List<IProductionLink> splits) GetInfeasibilityCandidates(List<ISolverRow> recipes) {
+    internal static (List<IProductionLink> merges, List<IProductionLink> splits) GetInfeasibilityCandidates(List<ISolverRow> recipes) {
         Graph<IProductionLink> graph = new Graph<IProductionLink>();
         List<IProductionLink> sources = [];
         List<IProductionLink> targets = [];
